@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>单摆仿真 · Pendulum Simulator</title>
+<style>
+  html { height: 100%; }
+  body {
+    margin: 0; height: 100%; background: #1a1a24; overflow: hidden;
+    display: flex; flex-direction: column;
+    font-family: Consolas, "Microsoft YaHei", monospace;
+  }
+  #stage { display: block; flex: 1 1 auto; min-height: 0; }
+  #panel {
+    flex: 0 0 auto;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+    gap: 14px 26px; padding: 12px 18px 14px;
+    background: #15151d;
+    border-top: 1px solid rgba(255,255,255,0.07);
+  }
+  .ctl { display: flex; align-items: center; gap: 9px; }
+  .ctl label { color: rgba(150,215,245,0.85); font-size: 12px; white-space: nowrap; }
+  .ctl .val { color: rgba(190,240,255,0.95); font-size: 12px; min-width: 84px; }
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 150px; height: 3px; border-radius: 2px;
+    background: rgba(255,255,255,0.14); outline: none; cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%; border: none;
+    background: #39b8e8; box-shadow: 0 0 8px rgba(70,190,240,0.8); cursor: pointer;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%; border: none;
+    background: #39b8e8; box-shadow: 0 0 8px rgba(70,190,240,0.8); cursor: pointer;
+  }
+  input[type="range"]::-moz-range-track {
+    height: 3px; border-radius: 2px; background: rgba(255,255,255,0.14);
+  }
+  #reset {
+    font: inherit; font-size: 12px; letter-spacing: 2px;
+    color: #9fe6ff; background: rgba(57,184,232,0.12);
+    border: 1px solid rgba(95,208,245,0.45); border-radius: 6px;
+    padding: 7px 18px; cursor: pointer;
+    transition: background 0.15s, box-shadow 0.15s;
+  }
+  #reset:hover { background: rgba(57,184,232,0.25); box-shadow: 0 0 12px rgba(70,190,240,0.35); }
+  #reset:active { transform: translateY(1px); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="panel">
+  <div class="ctl">
+    <label for="slen">摆长 L</label>
+    <input type="range" id="slen" min="100" max="350" step="1" value="200">
+    <span class="val" id="vlen">200 px</span>
+  </div>
+  <div class="ctl">
+    <label for="sgrav">重力 g</label>
+    <input type="range" id="sgrav" min="1" max="25" step="0.1" value="9.8">
+    <span class="val" id="vgrav">9.8 m/s²</span>
+  </div>
+  <div class="ctl">
+    <label for="sdamp">阻尼 c</label>
+    <input type="range" id="sdamp" min="0" max="0.010" step="0.001" value="0">
+    <span class="val" id="vdamp">0.000</span>
+  </div>
+  <button id="reset" type="button">重置摆动</button>
+</div>
+<script>
+"use strict";
+
+/* 物理参数采用 SI 单位：屏幕比例 100 px = 1 m，
+   故规格中的"摆长 200 px"对应 L = 2.0 m，与 g = 9.8 m/s² 量纲自洽 */
+const PX_PER_M = 100;
+const TH0 = 45 * Math.PI / 180;     // 初始摆角 45°
+let L      = 2.0;                   // 摆长（渲染为 200 px）
+let G      = 9.8;                   // 重力加速度 m/s²
+let dampC  = 0;                     // 阻尼系数（滑块原始值）
+
+let theta = TH0;                    // 当前摆角（相对竖直方向）
+let omega = 0;                      // 角速度 rad/s
+let t     = 0;                      // 仿真时间 s
+
+const STEP = 1 / 240;               // 物理积分固定步长
+let acc = 0;                        // 帧间时间累积器
+
+const cvs = document.getElementById("stage");
+const ctx = cvs.getContext("2d");
+let W = 0, H = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = cvs.clientWidth;
+  H = cvs.clientHeight;
+  cvs.width  = Math.round(W * dpr);
+  cvs.height = Math.round(H * dpr);
+  cvs.style.width  = W + "px";
+  cvs.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const trail = [];
+const TRAIL_MAX = 110;
+
+/* 半隐式欧拉积分非线性摆方程 θ'' = -(g/L)·sinθ - k·θ'（小角度时退化为简谐振动） */
+function integrate(dt) {
+  const k = dampC * 60;   // 滑块量纲为"每帧@60fps"衰减因子，×60 折算为每秒系数，保证与帧率无关
+  omega += (-(G / L) * Math.sin(theta) - k * omega) * dt;
+  theta += omega * dt;
+  t     += dt;
+}
+
+function draw() {
+  const p = { x: W / 2, y: Math.max(96, H * 0.26) };
+  const Lpx = L * PX_PER_M;
+  const bx = p.x + Lpx * Math.sin(theta);
+  const by = p.y + Lpx * Math.cos(theta);
+
+  ctx.fillStyle = "#1a1a24";
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = "rgba(255,255,255,0.03)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 60.5; x < W; x += 60) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 60.5; y < H; y += 60) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  ctx.setLineDash([4, 8]);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x, H); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const r = 74;
+  ctx.strokeStyle = "rgba(255,255,255,0.14)";
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, Math.PI / 2 - TH0, Math.PI / 2 + TH0); ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.font = "11px Consolas, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  [[TH0, "+45°"], [0, "0°"], [-TH0, "-45°"]].forEach(function (pair) {
+    const phi = Math.PI / 2 - pair[0];
+    ctx.beginPath();
+    ctx.moveTo(p.x + (r - 5) * Math.cos(phi), p.y + (r - 5) * Math.sin(phi));
+    ctx.lineTo(p.x + (r + 5) * Math.cos(phi), p.y + (r + 5) * Math.sin(phi));
+    ctx.stroke();
+    ctx.fillText(pair[1], p.x + (r + 22) * Math.cos(phi), p.y + (r + 22) * Math.sin(phi));
+  });
+
+  ctx.strokeStyle = "rgba(170,180,200,0.9)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(p.x - 64, p.y); ctx.lineTo(p.x + 64, p.y); ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(150,160,180,0.45)";
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const hx = p.x - 60 + i * 22;
+    ctx.moveTo(hx, p.y - 1);
+    ctx.lineTo(hx + 11, p.y - 11);
+  }
+  ctx.stroke();
+
+  trail.push({ x: bx, y: by });
+  if (trail.length > TRAIL_MAX) trail.shift();
+  for (let i = 1; i < trail.length; i++) {
+    ctx.strokeStyle = "rgba(95,208,245," + ((i / trail.length) * 0.3).toFixed(3) + ")";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+    ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = "rgba(200,212,228,0.92)";
+  ctx.lineWidth = 2;
+  ctx.shadowColor = "rgba(160,220,255,0.35)";
+  ctx.shadowBlur = 6;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(bx, by); ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#9aa5b8";
+  ctx.beginPath(); ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2); ctx.stroke();
+
+  const R = 17;
+  const grad = ctx.createRadialGradient(bx - 6, by - 6, 2, bx, by, R);
+  grad.addColorStop(0, "#dbf8ff");
+  grad.addColorStop(0.35, "#5fd0f5");
+  grad.addColorStop(1, "#0d7fbe");
+  ctx.shadowColor = "rgba(95,208,245,0.9)";
+  ctx.shadowBlur = 26;
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(bx, by, R, 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  const deg = theta * 180 / Math.PI;
+  const T0  = 2 * Math.PI * Math.sqrt(L / G);
+  const T45 = T0 * (1 + TH0 * TH0 / 16 + 11 * Math.pow(TH0, 4) / 3072);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "rgba(190,240,255,0.95)";
+  ctx.font = "bold 15px Consolas, 'Microsoft YaHei', monospace";
+  ctx.fillText("单摆仿真 · Pendulum Simulator", 18, 30);
+  ctx.font = "12px Consolas, 'Microsoft YaHei', monospace";
+  ctx.fillStyle = "rgba(140,225,255,0.85)";
+  ctx.fillText("L = " + Math.round(L * PX_PER_M) + " px (" + L.toFixed(2) + " m)   g = " + G.toFixed(1) + " m/s²   θ₀ = 45°   c = " + dampC.toFixed(3), 18, 54);
+  ctx.fillText("t = " + t.toFixed(1) + " s   θ = " + deg.toFixed(1) + "°   ω = " + omega.toFixed(2) + " rad/s", 18, 74);
+  ctx.fillStyle = "rgba(140,225,255,0.5)";
+  ctx.fillText("周期 T ≈ " + T45.toFixed(2) + " s（非线性）· 小角近似 " + T0.toFixed(2) + " s", 18, 94);
+
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(255,255,255,0.22)";
+  ctx.fillText("HTML5 Canvas · requestAnimationFrame", W - 16, H - 14);
+}
+
+const sLen  = document.getElementById("slen");
+const sGrav = document.getElementById("sgrav");
+const sDamp = document.getElementById("sdamp");
+const vLen  = document.getElementById("vlen");
+const vGrav = document.getElementById("vgrav");
+const vDamp = document.getElementById("vdamp");
+
+sLen.addEventListener("input", function () {
+  L = parseInt(sLen.value, 10) / PX_PER_M;
+  vLen.textContent = sLen.value + " px";
+  trail.length = 0;
+});
+sGrav.addEventListener("input", function () {
+  G = parseFloat(sGrav.value);
+  vGrav.textContent = G.toFixed(1) + " m/s²";
+});
+sDamp.addEventListener("input", function () {
+  dampC = parseFloat(sDamp.value);
+  vDamp.textContent = dampC.toFixed(3);
+});
+document.getElementById("reset").addEventListener("click", function () {
+  theta = TH0;
+  omega = 0;
+  t = 0;
+  trail.length = 0;
+});
+
+window.__sim = function () { return { theta: theta, omega: omega, t: t, L: L, G: G, damp: dampC }; };
+
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;   // 切换标签页返回时防止大步长造成能量失真
+  acc += dt;
+  while (acc >= STEP) { integrate(STEP); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

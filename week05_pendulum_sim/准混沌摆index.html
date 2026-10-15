@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>准混沌摆 · 双摆混沌仿真</title>
+<style>
+  html { height: 100%; }
+  body {
+    margin: 0; height: 100%; background: #1a1a24; overflow: hidden;
+    font-family: Consolas, "Microsoft YaHei", monospace;
+  }
+  #stage {
+    display: block; width: 100vw; height: 100vh;
+    cursor: default; touch-action: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+"use strict";
+
+/* ---------- 物理参数（SI 单位；屏幕比例 100 px = 1 m，与准单摆同族） ---------- */
+const PX_PER_M = 100;
+const m1 = 1, m2 = 1;               // 两摆球质量 kg
+const l1 = 1, l2 = 1;               // 两段摆长（各渲染 100 px）
+const g  = 9.8;                     // 重力加速度 m/s²
+
+let th1 = Math.PI / 2, w1 = 0;      // 上摆：初始 90°（水平），静止释放
+let th2 = Math.PI / 2, w2 = 0;      // 下摆：初始 90°（水平）
+let t = 0;
+
+const STEP = 1 / 240;               // RK4 固定积分步长
+
+/* ---------- 双摆拉格朗日二阶微分方程组（闭式解出角加速度） ----------
+   θ1'' = [-g(2m1+m2)sinθ1 - m2·g·sin(θ1-2θ2) - 2sin(θ1-θ2)·m2·(ω2²l2 + ω1²l1·cos(θ1-θ2))]
+          / [l1·(2m1+m2-m2·cos(2θ1-2θ2))]
+   θ2'' = [2sin(θ1-θ2)·(ω1²l1(m1+m2) + g(m1+m2)cosθ1 + ω2²l2·m2·cos(θ1-θ2))]
+          / [l2·(2m1+m2-m2·cos(2θ1-2θ2))]                                        */
+function deriv(y) {
+  const a1 = y[0], o1 = y[1], a2 = y[2], o2 = y[3];
+  const d = a1 - a2, sd = Math.sin(d), cd = Math.cos(d);
+  const den = 2 * m1 + m2 - m2 * Math.cos(2 * d);
+  const a1dd = (-g * (2 * m1 + m2) * Math.sin(a1)
+                - m2 * g * Math.sin(a1 - 2 * a2)
+                - 2 * sd * m2 * (o2 * o2 * l2 + o1 * o1 * l1 * cd)) / (l1 * den);
+  const a2dd = (2 * sd * (o1 * o1 * l1 * (m1 + m2)
+                + g * (m1 + m2) * Math.cos(a1)
+                + o2 * o2 * l2 * m2 * cd)) / (l2 * den);
+  return [o1, a1dd, o2, a2dd];
+}
+
+/* ---------- RK4 四阶龙格-库塔：局部截断误差 O(dt^5)，长期能量漂移极小 ---------- */
+function rk4Step(y, dt) {
+  const k1 = deriv(y);
+  const k2 = deriv(y.map(function (v, i) { return v + dt / 2 * k1[i]; }));
+  const k3 = deriv(y.map(function (v, i) { return v + dt / 2 * k2[i]; }));
+  const k4 = deriv(y.map(function (v, i) { return v + dt * k3[i]; }));
+  return y.map(function (v, i) {
+    return v + dt / 6 * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+  });
+}
+
+/* ---------- 能量（势能零点取双摆全部下垂的最低位形，故 E ≥ 0） ---------- */
+function energy() {
+  const ke = 0.5 * m1 * l1 * l1 * w1 * w1
+           + 0.5 * m2 * (l2 * l2 * w2 * w2 + l1 * l1 * w1 * w1
+           + 2 * l1 * l2 * w1 * w2 * Math.cos(th1 - th2));
+  const pe = m1 * g * l1 * (1 - Math.cos(th1))
+           + m2 * g * (l1 * (1 - Math.cos(th1)) + l2 * (1 - Math.cos(th2)));
+  return ke + pe;
+}
+
+/* ---------- 画布 ---------- */
+const cvs = document.getElementById("stage");
+const ctx = cvs.getContext("2d");
+let W = 0, H = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  cvs.width  = Math.round(W * dpr);
+  cvs.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  trail.length = 0;
+}
+window.addEventListener("resize", resize);
+
+/* ---------- 几何 ---------- */
+function pivot() { return { x: W / 2, y: Math.max(120, H * 0.32) }; }
+function bob1Pos() {
+  const p = pivot();
+  return { x: p.x + l1 * PX_PER_M * Math.sin(th1), y: p.y + l1 * PX_PER_M * Math.cos(th1) };
+}
+function bob2Pos() {
+  const b1 = bob1Pos();
+  return { x: b1.x + l2 * PX_PER_M * Math.sin(th2), y: b1.y + l2 * PX_PER_M * Math.cos(th2) };
+}
+
+/* ---------- 彩虹拖尾（第二摆球专属） ---------- */
+const trail = [];
+const TRAIL_MAX = 150;
+
+/* ---------- 鼠标拖拽：抓取摆球 → 冻结物理 → 松手释放 ---------- */
+let drag = 0;      // 0=无 1=上摆球 2=下摆球
+
+function hitBob(mx, my) {
+  const b1 = bob1Pos(), b2 = bob2Pos();
+  if (Math.hypot(mx - b2.x, my - b2.y) < 30) return 2;
+  if (Math.hypot(mx - b1.x, my - b1.y) < 26) return 1;
+  return 0;
+}
+
+cvs.addEventListener("pointerdown", function (e) {
+  e.preventDefault();
+  const r = cvs.getBoundingClientRect();
+  const hit = hitBob(e.clientX - r.left, e.clientY - r.top);
+  if (hit) {
+    drag = hit;
+    w1 = 0; w2 = 0;
+    trail.length = 0;
+    cvs.style.cursor = "grabbing";
+    try { cvs.setPointerCapture(e.pointerId); } catch (err) { /* 非真实指针（如自动化合成事件）时无活动指针可捕获 */ }
+  }
+});
+
+cvs.addEventListener("pointermove", function (e) {
+  const r = cvs.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (drag === 1) {
+    const p = pivot();
+    th1 = Math.atan2(mx - p.x, my - p.y);
+  } else if (drag === 2) {
+    const b1 = bob1Pos();
+    th2 = Math.atan2(mx - b1.x, my - b1.y);
+  } else {
+    cvs.style.cursor = hitBob(mx, my) ? "grab" : "default";
+  }
+});
+
+function endDrag() {
+  if (!drag) return;
+  drag = 0;
+  w1 = 0; w2 = 0;
+  E0 = energy();   // 释放后重锁能量基线，ΔE 只反映数值漂移而非配置改变
+  cvs.style.cursor = "grab";
+}
+cvs.addEventListener("pointerup", endDrag);
+cvs.addEventListener("pointercancel", endDrag);
+
+/* ---------- 绘制 ---------- */
+function draw() {
+  const p = pivot();
+  const b1 = bob1Pos(), b2 = bob2Pos();
+
+  ctx.fillStyle = "#1a1a24";
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = "rgba(255,255,255,0.03)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 60.5; x < W; x += 60) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 60.5; y < H; y += 60) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  ctx.setLineDash([4, 8]);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x, H); ctx.stroke();
+  ctx.setLineDash([]);
+
+  trail.push({ x: b2.x, y: b2.y });
+  if (trail.length > TRAIL_MAX) trail.shift();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+  const hueBase = (t * 42) % 360;
+  for (let i = 1; i < trail.length; i++) {
+    const f = i / trail.length;
+    ctx.strokeStyle = "hsla(" + ((hueBase + f * 300) % 360).toFixed(0)
+      + ", 95%, 62%, " + (f * f * 0.5).toFixed(3) + ")";
+    ctx.lineWidth = 0.8 + f * 3.2;
+    ctx.beginPath();
+    ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+    ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  }
+  ctx.globalCompositeOperation = "source-over";
+
+  ctx.strokeStyle = "rgba(200,212,228,0.9)";
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(b1.x, b1.y); ctx.stroke();
+  ctx.strokeStyle = "rgba(150,225,250,0.9)";
+  ctx.beginPath(); ctx.moveTo(b1.x, b1.y); ctx.lineTo(b2.x, b2.y); ctx.stroke();
+
+  ctx.strokeStyle = "rgba(170,180,200,0.9)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(p.x - 64, p.y); ctx.lineTo(p.x + 64, p.y); ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(150,160,180,0.45)";
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const hx = p.x - 60 + i * 22;
+    ctx.moveTo(hx, p.y - 1);
+    ctx.lineTo(hx + 11, p.y - 11);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = "#9aa5b8";
+  ctx.beginPath(); ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.beginPath(); ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2); ctx.stroke();
+
+  const R1 = 11;
+  const g1 = ctx.createRadialGradient(b1.x - 4, b1.y - 4, 2, b1.x, b1.y, R1);
+  g1.addColorStop(0, "#ffe9a8");
+  g1.addColorStop(0.4, "#f0b429");
+  g1.addColorStop(1, "#8a5a12");
+  ctx.shadowColor = "rgba(255,200,80,0.8)";
+  ctx.shadowBlur = 16;
+  ctx.fillStyle = g1;
+  ctx.beginPath(); ctx.arc(b1.x, b1.y, R1, 0, Math.PI * 2); ctx.fill();
+
+  const R2 = 15;
+  const g2 = ctx.createRadialGradient(b2.x - 5, b2.y - 5, 2, b2.x, b2.y, R2);
+  g2.addColorStop(0, "#eaffff");
+  g2.addColorStop(0.35, "#55d2f7");
+  g2.addColorStop(1, "#0b84c6");
+  ctx.shadowColor = "rgba(95,208,245,0.95)";
+  ctx.shadowBlur = 30;
+  ctx.fillStyle = g2;
+  ctx.beginPath(); ctx.arc(b2.x, b2.y, R2, 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  const E = energy();
+  const dE = E - (E0 === null ? E : E0);
+  const d1 = th1 * 180 / Math.PI, d2 = th2 * 180 / Math.PI;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "rgba(190,240,255,0.95)";
+  ctx.font = "bold 15px Consolas, 'Microsoft YaHei', monospace";
+  ctx.fillText("准混沌摆 · Double Pendulum Simulator", 18, 30);
+  ctx.font = "12px Consolas, 'Microsoft YaHei', monospace";
+  ctx.fillStyle = "rgba(140,225,255,0.85)";
+  ctx.fillText("l\u2081 = l\u2082 = 100 px (1.00 m)   m\u2081 = m\u2082 = 1 kg   g = 9.8 m/s\u00B2   RK4 @ 240 Hz", 18, 54);
+  ctx.fillText("t = " + t.toFixed(1) + " s   \u03B8\u2081 = " + d1.toFixed(1) + "\u00B0   \u03B8\u2082 = " + d2.toFixed(1)
+    + "\u00B0   \u03C9\u2081 = " + w1.toFixed(2) + "   \u03C9\u2082 = " + w2.toFixed(2) + " rad/s", 18, 74);
+  ctx.fillStyle = "rgba(140,225,255,0.5)";
+  ctx.fillText("E = " + E.toFixed(2) + " J   \u0394E = " + Math.abs(dE).toExponential(2)
+    + " J（能量守恒 ⇒ 无数值发散）", 18, 94);
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(255,255,255,0.3)";
+  ctx.fillText("拖拽任一摆球设置初始角度 · 释放即演化", W / 2, H - 34);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(255,255,255,0.22)";
+  ctx.fillText("HTML5 Canvas · Runge-Kutta 4 · requestAnimationFrame", W - 16, H - 14);
+}
+
+/* ---------- 能量基线（拖拽释放后重新锁定） ---------- */
+let E0 = energy();
+
+window.__sim = function () {
+  return { th1: th1, w1: w1, th2: th2, w2: w2, t: t, E: energy(), drag: drag };
+};
+
+/* ---------- 主循环：rAF 驱动 + 固定步长累积器 ---------- */
+let last = performance.now();
+let acc = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;   // 切换标签页返回时防止大步长造成能量失真
+  if (!drag) {
+    acc += dt;
+    let y = [th1, w1, th2, w2];
+    while (acc >= STEP) {
+      y = rk4Step(y, STEP);
+      acc -= STEP;
+      t += STEP;
+    }
+    th1 = y[0]; w1 = y[1]; th2 = y[2]; w2 = y[3];
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
